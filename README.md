@@ -1,129 +1,112 @@
-# Cloud Workload Forecasting Challenge
+# Cloud Workload Forecasting: Azure VM trace (data-v1)
 
-AI/ML take-home challenge built from the **Microsoft Azure Public Dataset V2** VM trace.
+This repo is my submission for the Atomity forecasting take-home. It forecasts two fleet-level targets for the final two hours of the curated Azure Public Dataset V2 trace: `active_vm_count` and `aggregate_cpu_utilization`. It also turns the forecast into a capacity-headroom policy.
 
-## Start here
+- **Report:** [`reports/final_report.md`](reports/final_report.md)
+- **Analysis notebook:** [`notebooks/analysis.ipynb`](notebooks/analysis.ipynb). It produces every number and figure in the report.
+- **Submission file:** `predictions.csv`
 
-1. Read [`ASSIGNMENT.md`](ASSIGNMENT.md).
-2. Read [`DATASET.md`](DATASET.md).
-3. Download the **`data-v1` GitHub Release** dataset and extract it as `challenge_data/`.
-4. Read [`SUBMISSION.md`](SUBMISSION.md).
-5. Implement your analysis and forecasting pipeline.
+## 1. Install
 
-The challenge dataset is distributed as a versioned GitHub Release rather than committed to the repository. The `data-v1` release contains the fixed curated dataset used for this assignment.
-
-## Environment setup
-
-Python **3.11 or newer** is required.
-
-Create a virtual environment:
-
-### Linux / macOS
+You need Python 3.11 or newer.
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### Windows PowerShell
-
-```powershell
-py -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-### Windows Command Prompt
-
-```cmd
-py -m venv .venv
-.venv\Scripts\activate.bat
-```
-
-Install the project and development dependencies:
-
-```bash
+python -m venv .venv
+source .venv/bin/activate              # Windows: .venv\Scripts\activate
 python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
-```
-
-Verify the installation:
-
-```bash
+python -m pip install -e ".[dev]"       # numpy, pandas, scikit-learn, pytest
+python -m pip install -e ".[analysis]"  # optional: matplotlib + jupyter for the notebook
 python -m pytest -q
 ```
 
-The repository includes a small test suite covering the starter forecasting utilities. Run it before beginning the assignment.
+## 2. Data
 
-## Dataset download
-
-The hiring dataset is distributed as the fixed `data-v1` release of this repository.
-
-**Download:** [Azure Dataset v1 Release](https://github.com/atomityhq/forecasting-challenge/releases/tag/data-v1)
-
-Download `data-v1.tar.gz` from the release and extract it into the repository as `challenge_data/`:
+Download `data-v1.tar.gz` from the [data-v1 release](https://github.com/atomityhq/forecasting-challenge/releases/tag/data-v1) and extract it into `challenge_data/`:
 
 ```bash
 mkdir -p challenge_data
 tar -xzf data-v1.tar.gz -C challenge_data
+(cd challenge_data && sha256sum -c SHA256SUMS)
 ```
 
-The resulting layout is:
+The data files are git-ignored and are never committed.
 
-```text
-challenge_data/
-├── vm_cpu_readings.csv.gz
-├── vm_metadata.csv.gz
-├── DATA_CARD.md
-└── SHA256SUMS
-```
-
-Verify the dataset before starting the assignment:
+## 3. Generate the predictions
 
 ```bash
-cd challenge_data
-sha256sum -c SHA256SUMS
+python -m cwfc.predict --data challenge_data --output predictions.csv
 ```
 
-You should see:
+This command does the following, in order:
 
-```text
-vm_cpu_readings.csv.gz: OK
-vm_metadata.csv.gz: OK
-DATA_CARD.md: OK
-```
+1. Load the data and validate it.
+2. Build both targets on a 5-minute grid.
+3. Split the series by time: the first 110 slots are training, the last 24 are the holdout.
+4. Run a rolling-origin backtest of every candidate model inside the training window.
+5. Select a model for each target by backtest MAE.
+6. Refit on all 110 training slots and forecast the 24 holdout slots.
+7. Write `predictions.csv` and check it against the `SUBMISSION.md` contract.
 
-The release is a real, curated subset of the Microsoft Azure Public Dataset V2. It is not synthetic data.
+On a laptop it takes about 3–4 minutes. Most of that time goes to the VM-level ML candidates. Add `--skip-panel` to run in about 10 seconds with the statistical models only. For this dataset that gives the same submission, because the statistical model wins the backtest.
 
-The dataset contains 10,000 VMs with 134 CPU measurements per VM at five-minute intervals, for a total of 1,340,000 CPU observations.
+It also writes these extra files to `artifacts/` (git-ignored):
 
-Use the exact `data-v1` release provided for this assignment. Do not substitute another dataset or a different version of the Azure Public Dataset.
+- `prediction_intervals.csv`: 5/10/50/90/95% bands.
+- `backtest_summary_<target>.csv` and `backtest_errors_<target>.csv`.
+- `run_metadata.json`: which model was selected and why, plus the data-quality report.
 
-## What you are solving
-
-The underlying data contains anonymized VM workload telemetry sampled every five minutes. Your job is to understand the workload and build a defensible forecasting pipeline for near-term aggregate demand.
-
-The challenge is intentionally open-ended. We evaluate reasoning, time-series methodology, leakage prevention, error analysis, reproducibility, and the quality of your operational conclusions—not just model complexity.
-
-## Expected environment
-
-Python 3.11+ is recommended.
+You score the forecast against the holdout in a separate step, after `predictions.csv` exists:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-pytest -q
+python -m cwfc.evaluate --data challenge_data --predictions predictions.csv
 ```
 
-Model dependencies are intentionally not prescribed. Add only what you need and document them.
+To rebuild the notebook and the report figures:
 
-## Source
+```bash
+jupyter nbconvert --to notebook --execute --inplace notebooks/analysis.ipynb
+```
 
-Microsoft Azure Public Dataset V2:
-https://github.com/Azure/AzurePublicDataset
+The pipeline doesn't depend on the exact files supplied. It handles a different number of VMs or timestamps, missing grid slots, duplicate or invalid readings, VMs that start or stop mid-trace, VMs with no metadata row, and a missing metadata file. `tests/test_pipeline.py` runs the CLI on a synthetic dataset with all of these problems.
 
-The official V2 documentation describes a 30-day VM trace with five-minute CPU readings, VM metadata, and encrypted subscription/deployment/VM identifiers. The full upstream trace is much larger than this challenge release.
+## 4. Main modelling decisions
 
-## Submission
+| Decision | Choice | Why |
+|---|---|---|
+| Cadence | Native 5 minutes | The data has no gaps, so there's no reason to resample. The holdout maps one-to-one to the grid. |
+| `active_vm_count` | Distinct VMs with a finite `avg_cpu` in [0, 100] at each slot. Duplicates are collapsed. | Required by the contract. In data-v1 it's 10,000 at every slot, because the release only kept VMs with complete traces (see the report). |
+| `aggregate_cpu_utilization` | Unweighted mean of valid `avg_cpu` per slot. An empty slot is NaN and is never imputed as a target. Model inputs forward-fill from the past only. | Follows the definition in the contract. |
+| Holdout | The final 24 observed timestamps. | Required. |
+| Validation | 16 expanding-window origins between slot 48 and slot 86, each forecasting 24 steps. All of them fall inside the 110 training slots. | Same task as production: fit on everything so far, forecast the next 2 hours. |
+| Baselines | Persistence, moving averages (6/12/24), seasonal-naive with a 1-hour season, and drift. | Every one goes through the same backtest. |
+| Candidates | `seasonal_profile`, `ses_profile`, and VM-level ML models (`panel_ridge`, `panel_gbm`, plus an ensemble). The ML models pool all 10k VMs and aggregate their forecasts bottom-up. | The aggregate series has only 110 points, but the 10k VM series behind it give the ML models about 1.5M training rows. |
+| Selection | Lowest backtest MAE. If two models are within 1%, the simpler one wins. | Decided before the holdout was looked at, and the holdout is never used. |
+| Selected (CPU) | **`ses_profile`**: an exponentially smoothed level plus a within-hour profile. The smoothing weight is fit in-sample on the history. | 15% lower backtest MAE than persistence, and it beats persistence on 62% of origins. |
+| Selected (count) | Persistence | Every candidate scores exactly 0 error, so the simplest model is chosen. |
+| Intervals | Empirical quantiles of the backtest residuals at each step. The bands are made monotone so they never narrow as the lead time grows. | Feeds the capacity policy. |
+| Features excluded | The metadata columns `avg_cpu`, `max_cpu`, `p95_max_cpu` and `timestamp_vm_deleted` | They summarise each VM's whole 30-day life, so they contain future information. The metadata `avg_cpu` correlates 0.87 with the VM's mean over this window. |
 
-Submit your work as a repository or archive according to [`SUBMISSION.md`](SUBMISSION.md).
+## 5. Layout
+
+```text
+src/cwfc/
+  data.py        load, clean, build targets on a regular grid, chronological split
+  baselines.py   persistence, moving average, drift, seasonal-naive, seasonal_profile, ses_profile
+  panel.py       VM-level pooled ML model (ridge / gradient boosting), aggregated bottom-up
+  models.py      model registry; History = the training-only view each model receives
+  backtest.py    rolling-origin backtest, metrics summary, model selection, residual quantiles
+  policy.py      forecast + quantile headroom policy and its evaluation
+  metrics.py     MAE, RMSE, sMAPE, WAPE, normalised MAE, interval coverage
+  predict.py     CLI that writes predictions.csv
+  evaluate.py    holdout scoring (reporting only; not imported by predict.py)
+notebooks/analysis.ipynb
+reports/final_report.md, reports/figures/
+tests/           unit tests + an end-to-end smoke run + a leakage test
+```
+
+## 6. How leakage is prevented
+
+- After the split, models only ever receive a `History` object. It holds the training-window targets and a VM matrix cut off at the last training timestamp. `predict.py` asserts this.
+- Every backtest origin uses only the slots before it. Every panel-model training row has its target strictly before the origin.
+- `tests/test_pipeline.py::test_holdout_values_cannot_influence_predictions` scrambles all the readings in the holdout window, and also drops 30% of them. It then checks that the predictions are byte-for-byte the same.
+- Phase-of-hour features come from timestamps, which are known in advance for every slot being forecast. They are computed relative to the trace start, because the absolute time of day isn't published.
